@@ -1,0 +1,214 @@
+name: Hunt Oracle Ampere A1
+
+on:
+  schedule:
+    # Every half hour, offset off the top of the hour where GitHub's scheduler
+    # is busiest and delays are worst. Each firing hunts for 25 of those 30
+    # minutes, which puts far more wall-clock time in front of Oracle than a
+    # */5 schedule of four-minute runs: the same minutes go to asking rather
+    # than to reinstalling the CLI, and the pace has room to settle.
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Total minutes for this run, setup included (max 350 - a job cannot exceed 6h).'
+        required: false
+        default: '29'
+      ocpu_ladder:
+        description: 'OCPU sizes to try, largest first. Just "2" means the full 2 OCPU / 12 GB or nothing.'
+        required: false
+        default: '2'
+      display_name:
+        description: 'Name for the instance if one is captured.'
+        required: false
+        default: 'ObliskIQ-lite'
+      chain:
+        description: 'Queue another run when this one ends without capacity. Set false for a one-off test run.'
+        required: false
+        default: 'true'
+
+# Overlapping hunts would double the request rate and invite OCI throttling.
+concurrency:
+  group: ampere-hunt
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  # To dispatch the next run in the chain. workflow_dispatch is one of the two
+  # events GITHUB_TOKEN is permitted to start a new workflow run with.
+  actions: write
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    env:
+      # The CLI writes a key-file label warning to stderr on every call. The
+      # key here is written fresh from a secret each run, so the advice does not
+      # apply, and the noise sits in the middle of error output.
+      SUPPRESS_LABEL_WARNING: 'True'
+
+    timeout-minutes: ${{ fromJSON(github.event.inputs.duration_minutes || '29') }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install OCI CLI
+        run: pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Configure and verify OCI credentials
+        env:
+          OCI_API_KEY: ${{ secrets.OCI_API_KEY }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: ./scripts/oci-setup.sh
+
+      - name: Write SSH public key
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$SSH_PUBLIC_KEY" ] || { echo "::error::Secret SSH_PUBLIC_KEY is empty."; exit 1; }
+          printf '%s\n' "$SSH_PUBLIC_KEY" | tr -d '\r' > ssh_key.pub
+
+      - name: Mark the start
+        id: mark
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Hunt
+        id: hunt
+        env:
+          OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
+          # Service limits live on the tenancy, which may not be the
+          # compartment the instance is launched into.
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCPU_LADDER: ${{ github.event.inputs.ocpu_ladder || '2' }}
+          DISPLAY_NAME: ${{ github.event.inputs.display_name || 'ObliskIQ-lite' }}
+          DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '29' }}
+        run: |
+          set -euo pipefail
+          # DURATION_MINUTES is the whole job budget and is also the job's
+          # timeout-minutes. Hold back HEADROOM minutes so the hunt ends on its
+          # own terms -- reporting a win, writing the summary -- rather than
+          # being cut off mid-launch by the runner.
+          HEADROOM=4
+          MINUTES=$DURATION_MINUTES
+          [ "$MINUTES" -gt 350 ] && MINUTES=350
+          WINDOW=$(( (MINUTES - HEADROOM) * 60 ))
+          [ "$WINDOW" -lt 60 ] && WINDOW=60
+          echo "Job budget ${MINUTES}m, hunting window $(( WINDOW / 60 ))m."
+          HUNT_SECONDS=$WINDOW ./scripts/hunt.sh
+
+      - name: Open an issue when an instance is captured
+        if: steps.hunt.outputs.result == 'launched'
+        uses: actions/github-script@v7
+        env:
+          INSTANCE_ID: ${{ steps.hunt.outputs.instance_id }}
+          PUBLIC_IP: ${{ steps.hunt.outputs.public_ip }}
+          OCPUS: ${{ steps.hunt.outputs.ocpus }}
+          MEMORY: ${{ steps.hunt.outputs.memory }}
+          PLACEMENT: ${{ steps.hunt.outputs.placement }}
+        with:
+          script: |
+            const { INSTANCE_ID, PUBLIC_IP, OCPUS, MEMORY, PLACEMENT } = process.env;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              assignees: [context.repo.owner],
+              title: `Ampere A1 captured: ${OCPUS} OCPU / ${MEMORY} GB`,
+              body: [
+                `An **VM.Standard.A1.Flex** instance was launched by [this run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`,
+                '',
+                `- Instance: \`${INSTANCE_ID}\``,
+                `- Shape: ${OCPUS} OCPU / ${MEMORY} GB`,
+                `- Placement: ${PLACEMENT}`,
+                `- Public IP: ${PUBLIC_IP || 'still provisioning - check the OCI console'}`,
+                '',
+                `cc @${context.repo.owner}`,
+                '',
+                'Later runs stop on their own now that the allowance is used up: the',
+                'pre-flight counts existing A1 OCPUs and exits without launching, so',
+                'nothing here starts a second instance. The schedule is safe to leave',
+                'on -- if this instance is ever terminated, hunting resumes by itself.',
+                'Disable the workflow in the Actions tab to stop it for good.',
+              ].join('\n'),
+            });
+
+      # ---------------------------------------------------------------------
+      # Keep the hunt alive without the scheduler.
+      # GitHub has not fired this repository's cron once -- not on */5, not on
+      # 7,37 -- so the schedule cannot be relied on to keep hunting. Each run
+      # instead queues the next one, which is subject to no scheduler at all.
+      # The cron stays as a backstop in case it ever starts working; the
+      # concurrency group keeps the two from running at the same time.
+      # ---------------------------------------------------------------------
+      - name: Decide whether to queue another run
+        id: chain
+        if: always()
+        env:
+          RESULT: ${{ steps.hunt.outputs.result }}
+          STARTED: ${{ steps.mark.outputs.epoch }}
+          CHAIN: ${{ github.event.inputs.chain || 'true' }}
+        run: |
+          set -uo pipefail
+          if [ "$CHAIN" = "false" ]; then
+            echo "Chaining disabled for this run."
+            echo "go=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          ELAPSED=$(( $(date +%s) - ${STARTED:-0} ))
+          case "$RESULT" in
+            launched|already-satisfied|no-fit)
+              echo "Nothing left to hunt for ($RESULT); the chain ends here."
+              GO=no ;;
+            no-capacity)
+              GO=yes ;;
+            *)
+              # The hunt errored. Continue only if it had been running a while:
+              # a misconfiguration fails in under a minute, and chaining on that
+              # would spin a new run every minute forever.
+              if [ "$ELAPSED" -ge 600 ]; then
+                echo "Hunt errored after ${ELAPSED}s; long enough to look transient, so continuing."
+                GO=yes
+              else
+                echo "Hunt errored after only ${ELAPSED}s, which looks like a configuration problem."
+                echo "::warning::Chain stopped: the hunt failed after ${ELAPSED}s. Fix the cause, then run the workflow again to restart it."
+                GO=no
+              fi ;;
+          esac
+          echo "go=$GO" >> "$GITHUB_OUTPUT"
+
+      - name: Queue the next hunt
+        if: always() && steps.chain.outputs.go == 'yes'
+        uses: actions/github-script@v7
+        env:
+          DISPLAY_NAME: ${{ github.event.inputs.display_name || 'ObliskIQ-lite' }}
+          OCPU_LADDER: ${{ github.event.inputs.ocpu_ladder || '2' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        with:
+          script: |
+            const ref = process.env.DEFAULT_BRANCH || 'main';
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'hunt_ampere.yml',
+              ref,
+              inputs: {
+                // Always the longest a job may run: one handover every ~6h
+                // rather than one every half hour, so the least possible time
+                // goes to reinstalling the CLI between runs.
+                duration_minutes: '350',
+                ocpu_ladder: process.env.OCPU_LADDER,
+                display_name: process.env.DISPLAY_NAME,
+                chain: 'true',
+              },
+            });
+            core.info(`Queued the next hunt on ${ref}.`);
