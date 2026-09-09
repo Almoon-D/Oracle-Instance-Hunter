@@ -112,9 +112,10 @@ ocic_capture() {
 #    would look like a transient server fault.
 # 2. HTTP status codes are matched against the "status" FIELD, never as bare
 #    digits anywhere in the response. Every OCI error body carries an
-#    opc-request-id of 30-odd alphanumeric characters, and a request id that
-#    happened to contain "403" used to be classified as an auth failure --
-#    which calls fail() and kills the whole run.
+#    opc-request-id of 30-odd alphanumeric characters, so "403" and "500"
+#    appear inside perfectly ordinary responses by chance. Matching those
+#    loose would classify a random capacity miss as an auth failure, and an
+#    auth failure calls fail() and ends the run. Never loosen this.
 # ---------------------------------------------------------------------------
 status_is() {
   case "$CLASSIFY_MSG" in
@@ -162,8 +163,12 @@ log "Hunting for $SHAPE, sizes [$OCPU_LADDER] OCPU, stopping at ${STOP_AT_TOTAL_
 
 # ---------------------------------------------------------------------------
 # Pre-flight: never launch past the configured allowance.
-# The original workflow had no such guard, so once a run succeeded the cron
-# kept launching more instances -- straight past the free tier into billing.
+#
+# This is the guard that separates a hunter from a billing accident. It runs
+# unattended and repeatedly, so without a count of what is already held every
+# successful run would be followed by another launch, and the free tier is
+# only free up to the allowance. Everything already held counts, including
+# STOPPED instances -- Oracle bills the shape, not the uptime.
 # ---------------------------------------------------------------------------
 log "Checking what this compartment already holds..."
 if ! ocic_capture compute instance list \
@@ -269,9 +274,12 @@ fi
 log "Sizes to try: ${LADDER[*]} OCPU."
 
 # ---------------------------------------------------------------------------
-# Resources: image, and every availability domain.
-# The original only ever tried availability domain [0], throwing away most of
-# the placements capacity can free up in.
+# Resources: the image, and every availability domain.
+#
+# Every domain is rotated through, not just the first. Capacity is released
+# per host pool, so a refusal in one availability domain says nothing at all
+# about the next; trying only one throws away most of the places a free
+# machine can appear.
 # ---------------------------------------------------------------------------
 ocic_capture compute image list \
   --compartment-id "$COMPARTMENT" \

@@ -25,7 +25,7 @@ on:
 
 # Overlapping hunts would double the request rate and invite OCI throttling.
 concurrency:
-  group: ampere-hunt
+  group: instance-hunt
   cancel-in-progress: false
 
 permissions:

@@ -4,7 +4,7 @@ name: Hunt watchdog
 # a cancelled run, a GitHub incident or a failed dispatch ends the chain
 # silently and hunting simply stops. This restarts it.
 #
-# It deliberately does NOT join the ampere-hunt concurrency group, so it can
+# It deliberately does NOT join the instance-hunt concurrency group, so it can
 # never displace a pending chained run the way a cron on the hunt workflow did.
 # It only ever dispatches when nothing is running or queued, so it cannot
 # double up either.

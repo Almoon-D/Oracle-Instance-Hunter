@@ -9,8 +9,25 @@ way through is to keep asking. The point of this repo is to keep asking
 *well* — rotating through every availability domain, backing off when Oracle
 throttles, and refusing to launch past the free allowance.
 
-Currently set to hunt for **1 OCPU / 6 GB**, stopping after the first one.
-Change that in [`hunt.config`](hunt.config).
+> **Status: finished and running.** The secrets are configured, the workflows
+> are live, and the hunt restarts itself. [`hunt.config`](hunt.config) is the
+> only file meant to be edited. Nothing here needs further development.
+
+**Currently hunting for: 1 OCPU / 6 GB, stopping after the first one.**
+
+## Start here
+
+1. **Check [`hunt.config`](hunt.config)** says what you want. It is a
+   commented file of plain settings — shape, size, when to stop, how fast to
+   ask. Edit and commit; the next run picks it up.
+2. **It is already running.** If you ever need to start it by hand: Actions →
+   *Hunt Oracle instance* → *Run workflow*.
+3. **Wait.** A win opens a GitHub issue assigned to you with the instance OCID
+   and public IP. Nothing else is needed.
+
+To stop it for good, disable **both** workflows in the Actions tab (*Hunt
+Oracle instance* and *Hunt watchdog*). Disabling only one leaves the other
+able to restart it.
 
 ## How it works
 
@@ -46,6 +63,20 @@ Each run:
    outcome, not a failure; failing the job on it would bury the real errors and
    fill your inbox.
 
+### What a run's result means
+
+Every run ends with one of four results, shown in the job summary:
+
+| Result | Meaning | Chain continues? |
+|---|---|---|
+| `no-capacity` | Oracle had nothing free this window. **The normal outcome.** | Yes |
+| `launched` | Got one. An issue is opened with the details. | No — done |
+| `already-satisfied` | `STOP_AT_TOTAL_OCPUS` is already held, so nothing was attempted. Runs cost ~45s from here on. | No — done |
+| `no-fit` | Some allowance is free but no size in `OCPU_LADDER` fits it. Add a smaller size to the ladder. | No |
+
+A red run means a real problem — bad credentials, no A1 quota at all, or an
+unrecognised error — and the job summary says which.
+
 ## The dashboard
 
 Everything about *what* is hunted for lives in [`hunt.config`](hunt.config):
@@ -75,37 +106,14 @@ what changing "the kind of instance" involves.
 (1,500 OCPU-hours + 9,000 GB-hours a month), which you may split as one
 2-OCPU machine or two 1-OCPU machines.
 
-This was **4 OCPU / 24 GB until 15 June 2026**, when Oracle halved it without
-an announcement and began enforcing the lower figure in August. Any repository,
-guide or hunter still describing 4/24 is out of date — check the date on
-anything you read about this. The tenancy's real service limits are read at
-startup and clamp the request regardless, so the hunter cannot ask for more
-than you are allowed even if the config says otherwise.
-
-## Setup
-
-Create these repository secrets (Settings → Secrets and variables → Actions):
-
-| Secret | Where it comes from |
-|---|---|
-| `OCI_API_KEY` | The whole `.pem` private key, `BEGIN`/`END` lines included, no passphrase |
-| `OCI_FINGERPRINT` | Shown next to the API key in the OCI console |
-| `OCI_USER_OCID` | Profile → User settings (`ocid1.user...`) |
-| `OCI_TENANCY_OCID` | Profile → Tenancy (`ocid1.tenancy...`) |
-| `OCI_REGION` | Your **home** region, e.g. `eu-madrid-1` — Always Free A1 only exists there |
-| `OCI_COMPARTMENT_OCID` | The compartment to launch into (the tenancy OCID works) |
-| `OCI_SUBNET_OCID` | A subnet in a VCN that already has an internet gateway and route |
-| `SSH_PUBLIC_KEY` | Contents of `id_ed25519.pub` — the **public** key, one line |
-
-`scripts/oci-setup.sh` checks all of this before the first launch attempt: it
-repairs CRLF-mangled and base64-wrapped keys, derives the fingerprint from the
-key and refuses to continue if it disagrees with `OCI_FINGERPRINT`, and makes a
-live API call to confirm the credentials are accepted.
+This was 4 OCPU / 24 GB until **15 June 2026**, when Oracle halved it without
+an announcement and began enforcing the lower figure in August. That date
+matters when reading anything else about this: a guide or hunter still
+describing 4/24 was written before the change. The tenancy's real service
+limits are read at startup and clamp the request regardless, so the hunter
+cannot ask for more than you are allowed even if the config says otherwise.
 
 ## Running it
-
-Start it once: Actions → *Hunt Oracle instance* → *Run workflow*. After that it
-keeps itself alive.
 
 Each run hunts for up to 350 minutes — the longest a GitHub job may live — and
 then, if it ended without capacity, dispatches the next run before it exits.
@@ -120,9 +128,9 @@ access token.
 
 **There is deliberately no cron on the hunt workflow.** GitHub keeps only one
 *pending* run per concurrency group, and a newer queued run replaces the older
-one. A schedule firing every half hour therefore kept cancelling the queued
-350-minute successor and replacing it with a 29-minute run — the scheduler was
-not helping the chain, it was competing with it.
+one. A schedule would therefore keep cancelling the queued 350-minute
+successor and putting a short run in its place — competing with the chain
+rather than backing it up.
 
 Instead `hunt-watchdog.yml` runs every three hours, checks whether a hunt is
 already running or queued, and dispatches one only if the chain has actually
@@ -140,16 +148,15 @@ Set `chain` to `false` for a one-off test run that should not queue a successor.
 
 ### Why no fault domain is pinned
 
-Earlier versions rotated through every availability domain **and** every fault
-domain, pinning each launch to one specific fault domain. That is backwards.
-Oracle's own documented workaround for `Out of host capacity` is to *create the
-instance without specifying a fault domain*: naming FD-1 asks for a host out of
-that one bucket, while omitting it asks Oracle for any eligible host in the
-whole availability domain. Omitting is a strict superset, so the same API call
-covers more ground.
+Oracle's documented workaround for `Out of host capacity` is to create the
+instance *without* specifying a fault domain. Naming FD-1 asks for a host out
+of that one bucket; omitting it asks Oracle for any eligible host in the whole
+availability domain. Omitting is a strict superset, so the same API call covers
+more ground — which is why the hunt rotates availability domains only, and
+leaves the fault domain to Oracle.
 
-`ROTATE_FAULT_DOMAINS="true"` in `hunt.config` restores the old behaviour if
-you want to experiment.
+`ROTATE_FAULT_DOMAINS="true"` in `hunt.config` pins them again if you want to
+experiment.
 
 ### When it wins
 
@@ -163,8 +170,7 @@ summary.
 After a win, later runs cost about 45 seconds each: the pre-flight counts what
 you now hold, sees `STOP_AT_TOTAL_OCPUS` is met and exits without launching. So
 leaving everything on is safe and free, and hunting restarts by itself if the
-instance is ever terminated. To stop for good, disable both workflows in the
-Actions tab.
+instance is ever terminated.
 
 ### Cost
 
@@ -182,11 +188,11 @@ converging on the rate the tenancy actually tolerates rather than a guess.
 **Asking faster is not the same as asking better.** Every request Oracle
 answers with 429 is a capacity check you did *not* make. A 5h45m run at a 45s
 floor made 230 attempts of which only 167 were real capacity checks — 27%
-thrown away. The floor is currently **75s** on that reasoning, but that figure
-is inherited, not measured here.
+thrown away. The floor is set to **75s** on that reasoning, but that figure is
+inherited from those runs, not measured against this tenancy.
 
-So every run now reports the numbers that settle it, in the job summary and as
-step outputs:
+So every run reports the numbers that would settle it, in the job summary and
+as step outputs:
 
 | Output | Meaning |
 |---|---|
@@ -219,6 +225,30 @@ would mean skipping the domain that would have won.
 Turn it on for a few runs to see whether it agrees with reality in your region,
 then decide. It needs `OCI_TENANCY_OCID`, because the report must be requested
 against the root compartment.
+
+## Secrets
+
+**These are already configured on this repository.** The table is here for
+rebuilding them, rotating a key, or setting the hunter up somewhere else
+(Settings → Secrets and variables → Actions).
+
+| Secret | Where it comes from |
+|---|---|
+| `OCI_API_KEY` | The whole `.pem` private key, `BEGIN`/`END` lines included, no passphrase |
+| `OCI_FINGERPRINT` | Shown next to the API key in the OCI console |
+| `OCI_USER_OCID` | Profile → User settings (`ocid1.user...`) |
+| `OCI_TENANCY_OCID` | Profile → Tenancy (`ocid1.tenancy...`) |
+| `OCI_REGION` | Your **home** region, e.g. `eu-madrid-1` — Always Free A1 only exists there |
+| `OCI_COMPARTMENT_OCID` | The compartment to launch into (the tenancy OCID works) |
+| `OCI_SUBNET_OCID` | A subnet in a VCN that already has an internet gateway and route |
+| `SSH_PUBLIC_KEY` | Contents of `id_ed25519.pub` — the **public** key, one line |
+
+`scripts/oci-setup.sh` checks all of this before the first launch attempt: it
+repairs CRLF-mangled and base64-wrapped keys, derives the fingerprint from the
+key and refuses to continue if it disagrees with `OCI_FINGERPRINT`, and makes a
+live API call to confirm the credentials are accepted. If a secret is wrong,
+the run fails in its first minute with a checklist rather than hours later with
+a cryptic `NotAuthenticated`.
 
 ## Tests
 
