@@ -32,10 +32,23 @@ case "$ARGS" in
 
   *"limits value list"*)
     case "$ARGS" in
-      *standard-a1-core-count*)   echo "${MOCK_CORE_LIMIT-4}" ;;
-      *standard-a1-memory-count*) echo "${MOCK_MEM_LIMIT-24}" ;;
+      *standard-a1-core-count*)   echo "${MOCK_CORE_LIMIT-2}" ;;
+      *standard-a1-memory-count*) echo "${MOCK_MEM_LIMIT-12}" ;;
       *) echo "" ;;
     esac
+    exit 0 ;;
+
+  *"compute compute-capacity-report create"*)
+    # MOCK_CAPACITY_REPORT maps an availability domain to a status, as
+    # "AD-1=AVAILABLE AD-2=OUT_OF_HOST_CAPACITY". Anything unlisted is
+    # reported OUT_OF_HOST_CAPACITY.
+    ad=$(printf '%s' "$ARGS" | sed -n 's/.*--availability-domain \([^ ]*\).*/\1/p')
+    st=OUT_OF_HOST_CAPACITY
+    for pair in ${MOCK_CAPACITY_REPORT:-}; do
+      case "$pair" in "$ad="*) st="${pair#*=}" ;; esac
+    done
+    printf '%s\n' "$ARGS" >> "$STATE/capacity_reports"
+    echo "{\"data\": {\"shape-availabilities\": [{\"availability-status\": \"$st\"}]}}"
     exit 0 ;;
 
   *"compute instance launch"*)

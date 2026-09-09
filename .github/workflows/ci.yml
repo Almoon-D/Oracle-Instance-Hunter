@@ -16,7 +16,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Shellcheck
-        run: shellcheck -x scripts/*.sh tests/*.sh
+        # hunt.config is included because it is sourced by hunt.sh: a stray
+        # quote in the dashboard would otherwise only show up as a six-hour
+        # run dying in its first second. SC2034 is disabled for it because
+        # every variable in it is "unused" from that file's point of view.
+        run: |
+          shellcheck -x scripts/*.sh tests/*.sh
+          shellcheck --shell=bash --exclude=SC2034 hunt.config
 
       # Plain YAML parsing does not catch Actions-level mistakes; expressions
       # have no arithmetic operators, for one, which is a silent workflow-load
