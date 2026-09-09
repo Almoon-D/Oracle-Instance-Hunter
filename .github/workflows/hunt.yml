@@ -1,35 +1,31 @@
-name: Hunt Oracle Ampere A1
+name: Hunt Oracle instance
 
+# No schedule. A run keeps the hunt alive by dispatching its own successor
+# before it exits, and hunt-watchdog.yml restarts the chain if it ever breaks.
+#
+# A cron here actively harmed the chain: GitHub keeps only one *pending* run
+# per concurrency group and a newer queued run replaces the older one, so a
+# scheduled firing could cancel the queued 350-minute successor and put a
+# 29-minute run in its place.
 on:
-  schedule:
-    # Every half hour, offset off the top of the hour where GitHub's scheduler
-    # is busiest and delays are worst. Each firing hunts for 25 of those 30
-    # minutes, which puts far more wall-clock time in front of Oracle than a
-    # */5 schedule of four-minute runs: the same minutes go to asking rather
-    # than to reinstalling the CLI, and the pace has room to settle.
-    - cron: '7,37 * * * *'
   workflow_dispatch:
     inputs:
       duration_minutes:
         description: 'Total minutes for this run, setup included (max 350 - a job cannot exceed 6h).'
         required: false
-        default: '29'
-      ocpu_ladder:
-        description: 'OCPU sizes to try, largest first. Just "2" means the full 2 OCPU / 12 GB or nothing.'
-        required: false
-        default: '2'
-      display_name:
-        description: 'Name for the instance if one is captured.'
-        required: false
-        default: 'ObliskIQ-lite'
+        default: '350'
       chain:
         description: 'Queue another run when this one ends without capacity. Set false for a one-off test run.'
         required: false
         default: 'true'
 
+# What is hunted for -- shape, size, pacing, when to stop -- lives in
+# hunt.config at the root of the repository. Nothing about the instance is
+# configured here.
+
 # Overlapping hunts would double the request rate and invite OCI throttling.
 concurrency:
-  group: ampere-hunt
+  group: instance-hunt
   cancel-in-progress: false
 
 permissions:
@@ -48,7 +44,7 @@ jobs:
       # apply, and the noise sits in the middle of error output.
       SUPPRESS_LABEL_WARNING: 'True'
 
-    timeout-minutes: ${{ fromJSON(github.event.inputs.duration_minutes || '29') }}
+    timeout-minutes: ${{ fromJSON(github.event.inputs.duration_minutes || '350') }}
 
     steps:
       - uses: actions/checkout@v4
@@ -91,9 +87,7 @@ jobs:
           # Service limits live on the tenancy, which may not be the
           # compartment the instance is launched into.
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
-          OCPU_LADDER: ${{ github.event.inputs.ocpu_ladder || '2' }}
-          DISPLAY_NAME: ${{ github.event.inputs.display_name || 'ObliskIQ-lite' }}
-          DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '29' }}
+          DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '350' }}
         run: |
           set -euo pipefail
           # DURATION_MINUTES is the whole job budget and is also the job's
@@ -124,32 +118,29 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               assignees: [context.repo.owner],
-              title: `Ampere A1 captured: ${OCPUS} OCPU / ${MEMORY} GB`,
+              title: `Instance captured: ${OCPUS} OCPU / ${MEMORY} GB`,
               body: [
-                `An **VM.Standard.A1.Flex** instance was launched by [this run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`,
+                `An instance was launched by [this run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`,
                 '',
                 `- Instance: \`${INSTANCE_ID}\``,
-                `- Shape: ${OCPUS} OCPU / ${MEMORY} GB`,
+                `- Size: ${OCPUS} OCPU / ${MEMORY} GB`,
                 `- Placement: ${PLACEMENT}`,
                 `- Public IP: ${PUBLIC_IP || 'still provisioning - check the OCI console'}`,
                 '',
                 `cc @${context.repo.owner}`,
                 '',
-                'Later runs stop on their own now that the allowance is used up: the',
-                'pre-flight counts existing A1 OCPUs and exits without launching, so',
-                'nothing here starts a second instance. The schedule is safe to leave',
-                'on -- if this instance is ever terminated, hunting resumes by itself.',
+                'Later runs stop on their own now that STOP_AT_TOTAL_OCPUS is met:',
+                'the pre-flight counts the OCPUs already held and exits without',
+                'launching, so nothing here starts a second instance. Raise',
+                '`STOP_AT_TOTAL_OCPUS` in hunt.config to keep hunting for more.',
                 'Disable the workflow in the Actions tab to stop it for good.',
               ].join('\n'),
             });
 
       # ---------------------------------------------------------------------
-      # Keep the hunt alive without the scheduler.
-      # GitHub has not fired this repository's cron once -- not on */5, not on
-      # 7,37 -- so the schedule cannot be relied on to keep hunting. Each run
-      # instead queues the next one, which is subject to no scheduler at all.
-      # The cron stays as a backstop in case it ever starts working; the
-      # concurrency group keeps the two from running at the same time.
+      # Keep the hunt alive: each run queues the next one before it exits, so
+      # hunting is continuous with a handover roughly every 5 3/4 hours and the
+      # least possible time spent reinstalling the CLI in between.
       # ---------------------------------------------------------------------
       - name: Decide whether to queue another run
         id: chain
@@ -180,7 +171,7 @@ jobs:
                 GO=yes
               else
                 echo "Hunt errored after only ${ELAPSED}s, which looks like a configuration problem."
-                echo "::warning::Chain stopped: the hunt failed after ${ELAPSED}s. Fix the cause, then run the workflow again to restart it."
+                echo "::warning::Chain stopped: the hunt failed after ${ELAPSED}s. Fix the cause, then run the workflow again to restart it. hunt-watchdog.yml will also restart it within three hours."
                 GO=no
               fi ;;
           esac
@@ -190,8 +181,6 @@ jobs:
         if: always() && steps.chain.outputs.go == 'yes'
         uses: actions/github-script@v7
         env:
-          DISPLAY_NAME: ${{ github.event.inputs.display_name || 'ObliskIQ-lite' }}
-          OCPU_LADDER: ${{ github.event.inputs.ocpu_ladder || '2' }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         with:
           script: |
@@ -199,15 +188,13 @@ jobs:
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              workflow_id: 'hunt_ampere.yml',
+              workflow_id: 'hunt.yml',
               ref,
               inputs: {
                 // Always the longest a job may run: one handover every ~6h
                 // rather than one every half hour, so the least possible time
                 // goes to reinstalling the CLI between runs.
                 duration_minutes: '350',
-                ocpu_ladder: process.env.OCPU_LADDER,
-                display_name: process.env.DISPLAY_NAME,
                 chain: 'true',
               },
             });
