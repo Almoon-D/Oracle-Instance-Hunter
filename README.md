@@ -158,6 +158,13 @@ leaves the fault domain to Oracle.
 `ROTATE_FAULT_DOMAINS="true"` in `hunt.config` pins them again if you want to
 experiment.
 
+Worth knowing for this tenancy: `eu-madrid-1` presents a **single availability
+domain**, so the rotation has nothing to rotate through and every attempt goes
+to the same place. That is not a fault — omitting the fault domain already asks
+for any host in that domain, which is the widest request available — but it
+means the placement machinery only starts earning its keep in a multi-domain
+region.
+
 ### When it wins
 
 The run opens a GitHub issue **assigned to the repository owner**, with the
@@ -186,13 +193,28 @@ every `TooManyRequests` and eases it back by a quarter on every clean answer,
 converging on the rate the tenancy actually tolerates rather than a guess.
 
 **Asking faster is not the same as asking better.** Every request Oracle
-answers with 429 is a capacity check you did *not* make. A 5h45m run at a 45s
-floor made 230 attempts of which only 167 were real capacity checks — 27%
-thrown away. The floor is set to **75s** on that reasoning, but that figure is
-inherited from those runs, not measured against this tenancy.
+answers with 429 is a capacity check you did *not* make — so the figure worth
+maximising is capacity checks per hour, not attempts per hour.
 
-So every run reports the numbers that would settle it, in the job summary and
-as step outputs:
+**This has been measured on this tenancy, and the floor turned out not to
+matter.** Two full windows of the same length, at the two floors:
+
+| | 45s floor | 75s floor |
+|---|---|---|
+| Attempts | 230 | 222 |
+| Real capacity checks | 167 | 164 |
+| Rate-limited (429) | 63 (27%) | 58 (26%) |
+| **Capacity checks per hour** | **29** | **28** |
+| Pace at end of run | 168s | 113s |
+
+Within the noise, identical. The adaptive backoff converges on the rate the
+tenancy tolerates whichever floor it starts from, so the binding constraint is
+Oracle's sustained rate for this tenancy — roughly 28–30 capacity checks an
+hour — and not `INTERVAL`. The floor stays at 75s because it reaches that rate
+with slightly less time spent backing off, but tuning it is not the lever it
+looks like.
+
+Every run reports the numbers, in the job summary and as step outputs:
 
 | Output | Meaning |
 |---|---|
@@ -202,11 +224,13 @@ as step outputs:
 | `checks_per_hour` | **The number that matters** |
 | `final_pace` | Where the adaptive pace settled |
 
-To tune it, run four ~6-hour hunts with `INTERVAL` set to 45, 75, 90 and 120 in
-`hunt.config`, and keep whichever gives the highest **`checks_per_hour`** — not
-the highest `attempts`. One report of an always-on hunter elsewhere measured
-353 real checks/day at 120s against 282 at 60s, so the curve is not monotonic;
-your region and tenancy may sit somewhere else on it entirely.
+45s and 75s are measured above and agree, so there is little point repeating
+them. What is still untested here is the slow end: one report of an always-on
+hunter elsewhere measured 353 real checks/day at 120s against 282 at 60s, which
+is the one reason to think a much higher floor might beat both. If you want to
+settle it, run ~6-hour hunts at `INTERVAL=120` and `INTERVAL=180` and compare
+`checks_per_hour` against the 28 above — that is the only number that decides
+it. Expect a null result.
 
 ## Capacity report
 
