@@ -28,7 +28,7 @@ jobs:
       # have no arithmetic operators, for one, which is a silent workflow-load
       # failure with zero jobs and no log to read.
       - name: Lint workflows
-        uses: rhysd/actionlint@v1.7.7
+        uses: rhysd/actionlint@v1.7.12
 
       - name: Hunt logic tests
         run: bash tests/test_hunt.sh
