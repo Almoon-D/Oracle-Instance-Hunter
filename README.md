@@ -11,7 +11,8 @@ throttles, and refusing to launch past the free allowance.
 
 > **Status: finished and running.** The secrets are configured, the workflows
 > are live, and the hunt restarts itself. [`hunt.config`](hunt.config) is the
-> only file meant to be edited. Nothing here needs further development.
+> only file meant to be edited. No feature work is outstanding — but it is not
+> maintenance-free, for one reason: see [Maintenance](#maintenance).
 
 **Currently hunting for: 1 OCPU / 6 GB, stopping after the first one.**
 
@@ -39,6 +40,7 @@ able to restart it.
 | `scripts/oci-setup.sh` | Builds `~/.oci/config` and proves the credentials work |
 | `scripts/hunt.sh` | The hunt itself |
 | `tests/test_hunt.sh` | 33 offline tests, run against a mock `oci` CLI |
+| `.github/dependabot.yml` | Watches the action versions the workflows pin |
 
 Each run:
 
@@ -273,6 +275,36 @@ key and refuses to continue if it disagrees with `OCI_FINGERPRINT`, and makes a
 live API call to confirm the credentials are accepted. If a secret is wrong,
 the run fails in its first minute with a checklist rather than hours later with
 a cryptic `NotAuthenticated`.
+
+## Maintenance
+
+There is one way this repository can stop working while looking perfectly
+healthy, and it is worth knowing about because it nearly happened.
+
+The workflows pin third-party actions, and actions are built against a Node
+runtime that GitHub eventually removes. That matters more here than in an
+ordinary repository, because the hunt and its safety net share those pins:
+`actions/checkout` failing stops the hunt, and `actions/github-script` failing
+stops both the chain dispatch *and* `hunt-watchdog.yml` — so the one thing
+designed to restart a broken chain breaks in the same moment. Nothing would
+report it. The Actions tab would simply go quiet.
+
+That is not hypothetical. This repository shipped on `checkout@v4`,
+`setup-python@v5` and `github-script@v7` — all Node 20 — and GitHub removes
+Node 20 from its runners on **23 September 2026**. It was caught with five days
+to spare. The only warning was a line every run had been printing into its own
+job log since the day the hunt went live, where nobody reads it while the thing
+is working.
+
+So: **the actions must stay on a major built for a supported Node runtime**, and
+`.github/dependabot.yml` now opens a grouped pull request when a new major
+appears. CI runs on that pull request, so a bump arrives already tested. Merge
+it, and confirm afterwards that a hunt run still starts and still queues its
+successor — CI does not exercise `github-script`, so the chain is only ever
+proved by a real handover.
+
+`requirements.txt` is deliberately left out of that automation; the `oci-cli`
+pin is intentional, and bumping it is a judgement call rather than hygiene.
 
 ## Tests
 

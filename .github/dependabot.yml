@@ -1,0 +1,30 @@
+# Watch the versions of the third-party actions the workflows pin.
+#
+# This exists because of a specific near miss. The workflows sat on
+# actions/checkout@v4, actions/setup-python@v5 and actions/github-script@v7 --
+# all Node 20 -- while GitHub was removing Node 20 from its runners. Nothing in
+# this repository would have reported that: CI only fails once the runtime is
+# gone, and by then the hunt, its chain dispatch and hunt-watchdog.yml all break
+# together, leaving nothing able to restart anything. The only warning was a line
+# in a job log nobody reads while the thing is quietly working.
+#
+# Dependabot opens a pull request; it never merges one. CI runs on that pull
+# request, so a bump arrives already tested.
+#
+# Only the actions are watched. requirements.txt is pinned on purpose -- see the
+# comment in it -- so a weekly oci-cli pull request would be noise against a
+# decision that was made deliberately.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Every pinned action, actionlint included, in one pull request rather
+    # than one apiece.
+    groups:
+      actions:
+        patterns:
+          - '*'
+    commit-message:
+      prefix: ci
