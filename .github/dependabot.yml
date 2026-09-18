@@ -20,12 +20,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    # One pull request for all of them rather than three to review separately.
+    # Every pinned action, actionlint included, in one pull request rather
+    # than one apiece.
     groups:
       actions:
         patterns:
           - '*'
     commit-message:
       prefix: ci
-    labels:
-      - dependencies
