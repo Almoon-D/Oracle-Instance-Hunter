@@ -14,7 +14,7 @@ set -uo pipefail
 # or a test can override a single value without editing the file -- hence the
 # snapshot/restore around the source.
 # ---------------------------------------------------------------------------
-CONFIG_VARS="SHAPE SHAPE_IS_FLEX OCPU_LADDER GB_PER_OCPU MEMORY_GB BOOT_VOLUME_GB
+CONFIG_VARS="SHAPE SHAPE_IS_FLEX OCPU_LADDER GB_PER_OCPU GB_PER_OCPU_LADDER MEMORY_GB BOOT_VOLUME_GB
              OS_NAME OS_VERSION DISPLAY_NAME STOP_AT_TOTAL_OCPUS INTERVAL JITTER
              PACE_CEILING MAX_UNKNOWN ROTATE_FAULT_DOMAINS LIMIT_CORE_NAME
              LIMIT_MEMORY_NAME CAPACITY_REPORT SSH_KEY_FILE HUNT_SECONDS"
@@ -41,7 +41,9 @@ done
 SHAPE="${SHAPE:-VM.Standard.A1.Flex}"
 SHAPE_IS_FLEX="${SHAPE_IS_FLEX:-true}"
 OCPU_LADDER="${OCPU_LADDER:-1}"
-GB_PER_OCPU="${GB_PER_OCPU:-6}"
+# Memory per OCPU to try, largest first. GB_PER_OCPU is the older single-value
+# form of the same setting and still works when the ladder is not set.
+GB_PER_OCPU_LADDER="${GB_PER_OCPU_LADDER:-${GB_PER_OCPU:-6}}"
 # Note the "-" rather than ":-" on the three settings below: for these an
 # empty value is a deliberate choice ("this shape has no such limit", "derive
 # memory from the ratio"), and ":-" would silently put the default back.
@@ -75,12 +77,57 @@ fail() { echo "::error::$*" >&2; exit 1; }
 summary() { [ -n "${GITHUB_STEP_SUMMARY:-}" ] && printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"; return 0; }
 emit()    { [ -n "${GITHUB_OUTPUT:-}" ] && printf '%s\n' "$*" >> "$GITHUB_OUTPUT"; return 0; }
 
-# Memory for a given OCPU count. A fixed (non-flex) shape has its memory set
-# by Oracle, so MEMORY_GB is used verbatim; a flex shape derives it from the
-# free tier's fixed GB-per-OCPU ratio.
+# Memory for a given OCPU count, at a given GB-per-OCPU step (the first step,
+# the target, when none is given). A fixed (non-flex) shape has its memory set
+# by Oracle, so MEMORY_GB is used verbatim.
 mem_for() {
   if [ -n "$MEMORY_GB" ]; then printf '%s' "$MEMORY_GB"
-  else printf '%s' "$(( $1 * GB_PER_OCPU ))"; fi
+  else printf '%s' "$(( $1 * ${2:-${MEM_STEPS[0]}} ))"; fi
+}
+
+# Memory-per-OCPU steps. A smaller memory request fits on strictly more hosts
+# than a larger one, so after asking for the target each placement also asks
+# for less. The free allowance is a TOTAL (12 GB), not a fixed ratio: A1.Flex
+# takes anywhere from 1 GB per OCPU upward. A fixed shape has its memory set by
+# Oracle, so it gets exactly one step and the ladder is ignored.
+read -r -a MEM_STEPS <<< "$GB_PER_OCPU_LADDER"
+for g in "${MEM_STEPS[@]}"; do
+  case "$g" in ''|*[!0-9]*|0) fail "GB_PER_OCPU_LADDER must be whole numbers of 1 or more, got '$GB_PER_OCPU_LADDER'." ;; esac
+done
+[ ${#MEM_STEPS[@]} -gt 0 ] || fail "GB_PER_OCPU_LADDER is empty."
+if [ "$SHAPE_IS_FLEX" != true ] || [ -n "$MEMORY_GB" ]; then
+  MEM_STEPS=("${MEM_STEPS[0]}")
+fi
+
+# What Oracle actually said, reduced to "status code: message" so that two
+# answers differing only in their opc-request-id count as the same answer.
+# Every distinct answer is logged verbatim the first time it is seen and
+# counted, so a run proves what "no capacity" really was instead of only
+# reporting how it was classified.
+declare -A ORACLE_SAID=()
+ORACLE_SAID_ORDER=()
+oracle_said() {
+  printf '%s' "$1" | python3 -c '
+import sys, json, re
+raw = sys.stdin.read()
+d = None
+a, b = raw.find("{"), raw.rfind("}")
+if a != -1 and b > a:
+    try:
+        d = json.loads(raw[a:b + 1])
+    except Exception:
+        d = None
+if not isinstance(d, dict):
+    d = {}
+    for k in ("status", "code", "message"):
+        m = re.search(r"\"%s\"\s*:\s*\"?([^\",}]*)" % k, raw)
+        if m:
+            d[k] = m.group(1).strip()
+if d.get("code") or d.get("message"):
+    print(("%s %s: %s" % (d.get("status", "?"), d.get("code", "?"), d.get("message", "")))[:300])
+else:
+    print(" ".join(raw.split())[:300])
+' 2>/dev/null
 }
 
 # The CLI writes a key-file label warning to stderr on every call; without this
@@ -160,6 +207,7 @@ ease_pace() {
 
 log "Config: $CONFIG_SOURCE"
 log "Hunting for $SHAPE, sizes [$OCPU_LADDER] OCPU, stopping at ${STOP_AT_TOTAL_OCPUS} OCPU held."
+[ ${#MEM_STEPS[@]} -gt 1 ] && log "Memory per OCPU, tried largest first: ${MEM_STEPS[*]} GB."
 
 # ---------------------------------------------------------------------------
 # Pre-flight: never launch past the configured allowance.
@@ -232,7 +280,8 @@ fi
 ALLOWANCE=$STOP_AT_TOTAL_OCPUS
 if [ -n "$CORE_LIMIT" ] && [ -n "$MEM_LIMIT" ]; then
   log "Tenancy $SHAPE service limits: ${CORE_LIMIT} OCPU / ${MEM_LIMIT} GB."
-  MEM_CAP=$(( MEM_LIMIT / GB_PER_OCPU ))
+  # Measured at the largest memory step: the most memory any attempt asks for.
+  MEM_CAP=$(( MEM_LIMIT / MEM_STEPS[0] ))
   [ "$CORE_LIMIT" -lt "$ALLOWANCE" ] && ALLOWANCE=$CORE_LIMIT
   [ "$MEM_CAP" -lt "$ALLOWANCE" ] && ALLOWANCE=$MEM_CAP
   if [ "$ALLOWANCE" -le 0 ]; then
@@ -404,14 +453,17 @@ build_placements() {
 build_placements
 log "Placements to rotate through: ${#PLACEMENTS[@]}$( [ "$ROTATE_FAULT_DOMAINS" = true ] && echo " (fault domains pinned)" || echo " (no fault domain pinned)")"
 
-# Flat attempt list: every placement, largest size first at each one.
+# Flat attempt list: every placement, largest size first at each one, and
+# within each size the largest memory first.
 ATTEMPTS=()
 build_attempts() {
   ATTEMPTS=()
-  local p n
+  local p n g
   for p in "${PLACEMENTS[@]}"; do
     for n in "${LADDER[@]}"; do
-      ATTEMPTS+=("$n|$p")
+      for g in "${MEM_STEPS[@]}"; do
+        ATTEMPTS+=("$n|$g|$p")
+      done
     done
   done
 }
@@ -441,14 +493,13 @@ UNKNOWNS=0
 # eases back down on a clean answer, converging on the sustainable rate instead
 # of being guessed up front.
 PACE="$INTERVAL"
-declare -A SEEN_ERRORS=()
 
 log "Hunting for ${HUNT_SECONDS}s, starting at one attempt every ${INTERVAL}s."
 
 while [ "$SECONDS" -lt "$DEADLINE" ]; do
-  IFS='|' read -r ocpus ad fd <<< "${ATTEMPTS[$(( ATTEMPT % ${#ATTEMPTS[@]} ))]}"
+  IFS='|' read -r ocpus gbper ad fd <<< "${ATTEMPTS[$(( ATTEMPT % ${#ATTEMPTS[@]} ))]}"
   ATTEMPT=$(( ATTEMPT + 1 ))
-  mem=$(mem_for "$ocpus")
+  mem=$(mem_for "$ocpus" "$gbper")
 
   args=(
     compute instance launch
@@ -483,6 +534,7 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
       emit "instance_id=$INSTANCE_ID"
       emit "ocpus=$ocpus"
       emit "memory=$mem"
+      emit "memory_target=$(mem_for "$ocpus" "${MEM_STEPS[0]}")"
       emit "placement=$ad${fd:+ / $fd}"
 
       IP=""
@@ -501,6 +553,8 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
       summary "|---|---|"
       summary "| Instance | \`$INSTANCE_ID\` |"
       summary "| Shape | $SHAPE — ${ocpus} OCPU / ${mem} GB |"
+      [ "$mem" -lt "$(mem_for "$ocpus" "${MEM_STEPS[0]}")" ] \
+        && summary "| Memory | Captured below the $(mem_for "$ocpus" "${MEM_STEPS[0]}") GB target; it can be raised later with Edit shape |"
       summary "| Placement | $ad${fd:+ / $fd} |"
       summary "| Public IP | ${IP:-pending} |"
       summary "| Attempts this run | $ATTEMPT |"
@@ -512,6 +566,14 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
 
   KIND=$(classify "$RESPONSE")
   FIRST_LINE=$(printf '%s' "$RESPONSE" | tr '\n' ' ' | tr -s ' ' | cut -c1-500)
+  SAID=$(oracle_said "$RESPONSE")
+  SAID="${SAID:-$FIRST_LINE}"
+  if [ -z "${ORACLE_SAID[$SAID]:-}" ]; then
+    ORACLE_SAID[$SAID]=0
+    ORACLE_SAID_ORDER+=("$SAID")
+    log "Oracle said (first time this run, classified $KIND): $SAID"
+  fi
+  ORACLE_SAID[$SAID]=$(( ORACLE_SAID[$SAID] + 1 ))
 
   case "$KIND" in
     capacity)
@@ -566,10 +628,7 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
     unknown)
       UNKNOWNS=$(( UNKNOWNS + 1 ))
       UNKNOWN_STREAK=$(( UNKNOWN_STREAK + 1 ))
-      if [ -z "${SEEN_ERRORS[$FIRST_LINE]:-}" ]; then
-        SEEN_ERRORS[$FIRST_LINE]=1
-        log "Unrecognised OCI error (#$UNKNOWN_STREAK): $FIRST_LINE"
-      fi
+      [ "${ORACLE_SAID[$SAID]}" -eq 1 ] && log "Unrecognised OCI error (#$UNKNOWN_STREAK): $FIRST_LINE"
       if [ "$UNKNOWN_STREAK" -ge "$MAX_UNKNOWN" ]; then
         fail "$MAX_UNKNOWN consecutive unrecognised errors, last: $FIRST_LINE"
       fi
@@ -620,6 +679,17 @@ summary "| INTERVAL floor | ${INTERVAL}s |"
 summary "| Pace at end of run | ${PACE}s |"
 summary "| Placements rotated | ${#PLACEMENTS[@]} |"
 summary "| Window | ${ELAPSED}s |"
+[ ${#MEM_STEPS[@]} -gt 1 ] && summary "| Memory per OCPU tried | ${MEM_STEPS[*]} GB |"
+if [ ${#ORACLE_SAID_ORDER[@]} -gt 0 ]; then
+  summary ""
+  summary "**What Oracle actually answered** (verbatim, request ids stripped):"
+  summary ""
+  summary "| Count | Answer |"
+  summary "|---|---|"
+  for said in "${ORACLE_SAID_ORDER[@]}"; do
+    summary "| ${ORACLE_SAID[$said]} | \`${said//|/\\|}\` |"
+  done
+fi
 if [ "$THROTTLES" -gt "$MISSES" ]; then
   summary ""
   summary "More attempts were throttled than answered, so most of the window went to backing off. Raise \`INTERVAL\` (currently ${INTERVAL}s) in \`hunt.config\` to hunt at a rate this tenancy tolerates."

@@ -14,7 +14,8 @@ throttles, and refusing to launch past the free allowance.
 > only file meant to be edited. No feature work is outstanding — but it is not
 > maintenance-free, for one reason: see [Maintenance](#maintenance).
 
-**Currently hunting for: 1 OCPU / 6 GB, stopping after the first one.**
+**Currently hunting for: 1 OCPU at 6, 4 or 2 GB (6 first), stopping after the
+first one.**
 
 ## Start here
 
@@ -39,7 +40,7 @@ able to restart it.
 | `.github/workflows/hunt-watchdog.yml` | Restarts the chain if it ever stops |
 | `scripts/oci-setup.sh` | Builds `~/.oci/config` and proves the credentials work |
 | `scripts/hunt.sh` | The hunt itself |
-| `tests/test_hunt.sh` | 33 offline tests, run against a mock `oci` CLI |
+| `tests/test_hunt.sh` | 38 offline tests, run against a mock `oci` CLI |
 | `.github/dependabot.yml` | Watches the action versions the workflows pin |
 
 Each run:
@@ -94,7 +95,7 @@ The shipped preset:
 ```sh
 SHAPE="VM.Standard.A1.Flex"
 OCPU_LADDER="1"            # ask for a 1 OCPU machine
-GB_PER_OCPU="6"            # free tier fixes A1 at 6 GB per OCPU -> 6 GB
+GB_PER_OCPU_LADDER="6 4 2" # ask for 6 GB, then 4, then 2, and round again
 STOP_AT_TOTAL_OCPUS="1"    # stop for good once one is captured
 ```
 
@@ -114,6 +115,40 @@ matters when reading anything else about this: a guide or hunter still
 describing 4/24 was written before the change. The tenancy's real service
 limits are read at startup and clamp the request regardless, so the hunter
 cannot ask for more than you are allowed even if the config says otherwise.
+
+The 12 GB is a **total**, not a fixed 6 GB per OCPU: `A1.Flex` accepts any
+amount from 1 GB per OCPU upward. That is what the memory ladder exploits.
+
+### The memory ladder
+
+`GB_PER_OCPU_LADDER="6 4 2"` makes every cycle ask for 1 OCPU / 6 GB, then
+1 OCPU / 4 GB, then 1 OCPU / 2 GB. A smaller request fits on strictly more
+hosts, so the smaller steps catch partly-full hosts the 6 GB request cannot
+use. The price is that only a third of the checks ask for the full 6 GB; with
+~45,000 checks at 6 GB and no win, that is a trade worth making.
+
+A win below the target says so in its issue, with the steps to grow it: OCI
+console → the instance → *Edit* → *Edit shape*. Oracle reboots the instance to
+apply it, and like any placement the resize can be refused for lack of
+capacity. Set `GB_PER_OCPU_LADDER="6"` to hunt for 6 GB only.
+
+### Why it has not won yet
+
+Measured, not guessed: from 9 September to 18 November 2026 the chain ran
+about 1,670 hours, made roughly 45,000 real capacity checks against
+`eu-madrid-1` and got `Out of host capacity` on every one. Credentials, limits
+(2 OCPU / 12 GB), image and subnet were all fine throughout.
+
+What the hunter cannot change:
+
+- **Madrid has one availability domain**, and Always Free compute must live in
+  the home region, which cannot be changed. There is nowhere else to ask.
+- **The account is Free Tier only.** Oracle's own fix for this error is to
+  upgrade to Pay As You Go, and community reports consistently say PAYG
+  accounts get A1 far more easily. That has been **deliberately declined**: a
+  PAYG account bills anything over the free allowance instead of refusing it,
+  and an accidental bill is not an acceptable risk here. The hunter is
+  therefore playing the long game on purpose.
 
 ## Running it
 
@@ -248,9 +283,21 @@ report returning `AVAILABLE` for a domain where A1 launches failed and
 `OUT_OF_HOST_CAPACITY` for one where they succeeded. Gating launches on it
 would mean skipping the domain that would have won.
 
-Turn it on for a few runs to see whether it agrees with reality in your region,
-then decide. It needs `OCI_TENANCY_OCID`, because the report must be requested
-against the root compartment.
+It is **on**, so every run's log records Oracle's own verdict on the region
+next to what the launches got. In a single-domain region it has nothing to
+reorder; its value is purely as evidence. It costs one call per availability
+domain per run. It needs `OCI_TENANCY_OCID`, because the report must be
+requested against the root compartment.
+
+## What Oracle actually answered
+
+The classifier reduces every refusal to a word (`capacity`, `throttled`, …),
+which is enough to act on but not enough to prove anything. So each run also
+logs every **distinct** answer verbatim the first time it sees it — reduced to
+`status code: message`, with the per-request id stripped so identical answers
+count as one — and the job summary ends with a table of each answer and how
+many times it came back. If Oracle ever starts saying something other than
+`500 InternalError: Out of host capacity.`, that table is where it shows.
 
 ## Secrets
 
@@ -306,10 +353,16 @@ proved by a real handover.
 `requirements.txt` is deliberately left out of that automation; the `oci-cli`
 pin is intentional, and bumping it is a judgement call rather than hygiene.
 
+One more date to watch: GitHub logs that the REST call `github-script` uses to
+dispatch the next run is deprecated and **scheduled for removal on 10 March
+2028**. Nothing to do before then, but it would stop the chain and the
+watchdog together, exactly like the Node 20 removal would have. Check the
+"Queue the next hunt" step's log for that warning well before the date.
+
 ## Tests
 
 ```
-bash tests/test_hunt.sh      # 33 cases against tests/mock_oci.sh, no tenancy needed
+bash tests/test_hunt.sh      # 38 cases against tests/mock_oci.sh, no tenancy needed
 shellcheck -x scripts/*.sh tests/*.sh
 shellcheck --shell=bash --exclude=SC2034 hunt.config
 actionlint                   # workflow syntax; plain YAML parsing misses this
