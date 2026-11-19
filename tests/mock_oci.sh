@@ -77,7 +77,10 @@ case "$ARGS" in
       echo '{"data": {"id": "ocid1.instance.oc1.eu-madrid-1.WON", "lifecycle-state": "PROVISIONING"}}'
       exit 0
     fi
-    printf '%s\n' "${MOCK_LAUNCH_ERROR:-ServiceError: {\"code\": \"InternalError\", \"message\": \"Out of host capacity.\", \"status\": 500}}" >&2
+    # "@N@" in the error becomes the attempt number, so a test can give every
+    # answer its own opc-request-id the way the live service does.
+    err="${MOCK_LAUNCH_ERROR:-ServiceError: {\"code\": \"InternalError\", \"message\": \"Out of host capacity.\", \"status\": 500}}"
+    printf '%s\n' "${err//@N@/$n}" >&2
     exit 1 ;;
 esac
 

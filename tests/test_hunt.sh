@@ -329,11 +329,11 @@ fi
 # =========================================================================
 
 # --- 25. A win is reported with its details -----------------------------
-run_hunt win MOCK_SUCCEED_ON=2
+run_hunt win MOCK_SUCCEED_ON=1
 if [ "$RC" -eq 0 ] && grep -q 'result=launched' <<< "$OUT" \
    && grep -q 'instance_id=ocid1.instance.oc1.eu-madrid-1.WON' <<< "$OUT" \
    && grep -q 'public_ip=203.0.113.42' <<< "$OUT" \
-   && grep -q 'ocpus=1' <<< "$OUT" && grep -q 'memory=6' <<< "$OUT"; then
+   && grep -q 'ocpus=1' <<< "$OUT" && grep -q "^memory=6$" <<< "$OUT"; then
   ok "reports instance id, size and public IP on a successful launch"
 else
   bad "reports instance id, size and public IP on a successful launch" "$OUT
@@ -402,8 +402,8 @@ fi
 #  Capacity report (advisory only)
 # =========================================================================
 
-# --- 30. Off by default -------------------------------------------------
-run_hunt report_off MOCK_SUCCEED_ON=999
+# --- 30. Off means off ---------------------------------------------------
+run_hunt report_off MOCK_SUCCEED_ON=999 CAPACITY_REPORT=false
 if [ ! -f "$TMP/report_off/state/capacity_reports" ]; then
   ok "does not call the capacity report unless CAPACITY_REPORT is on"
 else
@@ -445,6 +445,74 @@ if [ "$RC" -ne 0 ] && grep -q 'is missing' <<< "$LOG"; then
   ok "refuses to launch when the SSH public key is missing"
 else
   bad "refuses to launch when the SSH public key is missing" "$LOG"
+fi
+
+# =========================================================================
+#  Memory ladder
+# =========================================================================
+
+# --- 34. Each placement asks for the target, then for less memory -------
+# The free allowance is 12 GB in total, not 6 GB per OCPU, and a smaller
+# request fits on strictly more hosts.
+run_hunt mem_ladder MOCK_SUCCEED_ON=999 HUNT_SECONDS=8 GB_PER_OCPU_LADDER='6 4 2'
+MEMS=$(grep -oE '"memoryInGBs": [0-9]+' "$LAUNCHES" | grep -oE '[0-9]+' | head -4 | tr '\n' ' ')
+if [ "$MEMS" = "6 4 2 6 " ] && grep -q 'Memory per OCPU, tried largest first: 6 4 2 GB' <<< "$LOG"; then
+  ok "cycles memory per OCPU largest first: 6, 4, 2, then round again"
+else
+  bad "cycles memory per OCPU largest first: 6, 4, 2, then round again" "memory sequence: $MEMS
+$LOG"
+fi
+
+# --- 35. A win on a smaller step says so --------------------------------
+run_hunt mem_win MOCK_SUCCEED_ON=2 HUNT_SECONDS=8 GB_PER_OCPU_LADDER='6 4 2'
+if grep -q 'result=launched' <<< "$OUT" && grep -q '^memory=4$' <<< "$OUT" \
+   && grep -q '^memory_target=6$' <<< "$OUT" \
+   && grep -q 'below the 6 GB target' <<< "$SUMMARY"; then
+  ok "a capture below the memory target reports both the size and the target"
+else
+  bad "a capture below the memory target reports both the size and the target" "$OUT
+$SUMMARY"
+fi
+
+# --- 36. A single step behaves exactly as before ------------------------
+run_hunt mem_single MOCK_SUCCEED_ON=999 HUNT_SECONDS=5 GB_PER_OCPU_LADDER=6
+if ! grep -qv '"memoryInGBs": 6' "$LAUNCHES" && ! grep -q 'Memory per OCPU' <<< "$LOG"; then
+  ok "a one-step ladder only ever asks for that memory"
+else
+  bad "a one-step ladder only ever asks for that memory" "$(cat "$LAUNCHES")"
+fi
+
+# --- 37. A bad ladder fails before anything is launched -----------------
+run_hunt mem_bad GB_PER_OCPU_LADDER='6 lots'
+if [ "$RC" -ne 0 ] && grep -q 'GB_PER_OCPU_LADDER must be whole numbers' <<< "$LOG" \
+   && [ ! -f "$LAUNCHES" ]; then
+  ok "rejects a GB_PER_OCPU_LADDER that is not whole numbers"
+else
+  bad "rejects a GB_PER_OCPU_LADDER that is not whole numbers" "$LOG"
+fi
+
+# =========================================================================
+#  What Oracle actually said
+# =========================================================================
+
+# --- 38. Each distinct answer is logged verbatim once, then counted -----
+# The classifier only says "capacity"; this is the evidence of what the
+# message really was. Request ids differ on every call and must not make
+# identical answers look distinct.
+run_hunt said MOCK_SUCCEED_ON=999 HUNT_SECONDS=8 MOCK_THROTTLE_ON='2' \
+  MOCK_LAUNCH_ERROR='ServiceError: {"code": "InternalError", "message": "Out of host capacity.", "opc-request-id": "req-@N@", "status": 500}'
+CAP_LINES=$(grep -c 'Oracle said (first time this run, classified capacity): 500 InternalError: Out of host capacity.' <<< "$LOG")
+# shellcheck disable=SC2016  # the backticks are literal Markdown, not a command
+ROW='^\| [0-9]+ \| `500 InternalError: Out of host capacity.` \|$'
+if [ "$CAP_LINES" -eq 1 ] \
+   && grep -q 'Oracle said (first time this run, classified throttled): 429 TooManyRequests' <<< "$LOG" \
+   && grep -q 'What Oracle actually answered' <<< "$SUMMARY" \
+   && grep -qE "$ROW" <<< "$SUMMARY"; then
+  ok "logs each distinct Oracle answer once and tallies it in the summary"
+else
+  bad "logs each distinct Oracle answer once and tallies it in the summary" "capacity lines: $CAP_LINES
+$LOG
+$SUMMARY"
 fi
 
 echo

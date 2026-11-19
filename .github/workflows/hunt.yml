@@ -115,10 +115,24 @@ jobs:
           PUBLIC_IP: ${{ steps.hunt.outputs.public_ip }}
           OCPUS: ${{ steps.hunt.outputs.ocpus }}
           MEMORY: ${{ steps.hunt.outputs.memory }}
+          MEMORY_TARGET: ${{ steps.hunt.outputs.memory_target }}
           PLACEMENT: ${{ steps.hunt.outputs.placement }}
         with:
           script: |
-            const { INSTANCE_ID, PUBLIC_IP, OCPUS, MEMORY, PLACEMENT } = process.env;
+            const { INSTANCE_ID, PUBLIC_IP, OCPUS, MEMORY, MEMORY_TARGET, PLACEMENT } = process.env;
+            // Captured on a smaller memory step than the target: say so, and
+            // how to grow it, rather than leave it to be noticed later.
+            const belowTarget = Number(MEMORY) < Number(MEMORY_TARGET || MEMORY);
+            const memoryNote = belowTarget ? [
+              '',
+              `**Memory is ${MEMORY} GB, below the ${MEMORY_TARGET} GB target.** A smaller`,
+              'request was what fitted. To grow it: OCI console -> the instance ->',
+              `Edit -> Edit shape -> memory ${MEMORY_TARGET} GB. Oracle reboots the instance`,
+              'to apply it, and the resize can be refused for lack of capacity like any',
+              'launch, so do it when a reboot is acceptable and confirm the instance is',
+              'RUNNING afterwards.',
+              'Stay within the 12 GB Always Free total.',
+            ] : [];
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -131,6 +145,7 @@ jobs:
                 `- Size: ${OCPUS} OCPU / ${MEMORY} GB`,
                 `- Placement: ${PLACEMENT}`,
                 `- Public IP: ${PUBLIC_IP || 'still provisioning - check the OCI console'}`,
+                ...memoryNote,
                 '',
                 `cc @${context.repo.owner}`,
                 '',
